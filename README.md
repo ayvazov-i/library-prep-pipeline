@@ -1,17 +1,20 @@
 # Chemical Library Preparation Pipeline
 
-Prepares raw supplier catalogues for virtual screening.
+Prepares raw supplier catalogues for virtual screening. Tested on 1M Moses molecules in 5.7 hours (32 cores).
 
-## Steps
-1. Load and merge supplier catalogues
-2. Strip salts
-3. Filter (BRENK, Lipinski, PAINS, complexity, rings, aggregator)
-4. Enumerate stereoisomers and tautomers
-5. Deduplicate
-6. Ionise at biological pH (Dimorphite-DL)
-7. Generate 3D conformers (rdkonf)
+## What it does
+
+1. **Load and merge** supplier catalogues — reads SMILES files from one or more suppliers into a single table, keeping track of original supplier SMILES and IDs throughout.
+2. **Strip salts** — removes counter-ions (Na+, Cl−, etc.) and keeps the largest fragment.
+3. **Filter** — applies BRENK (reactive/unstable groups), Lipinski Rule of Five, ring count/size limits, an aggregator heuristic, and PAINS. Each rejection is logged with the reason.
+4. **Stereoisomer handling** — removes molecules with more than 2 unspecified stereocentres, then enumerates the remaining unspecified ones (up to 4 isomers per molecule). Specified centres are preserved.
+5. **Tautomer enumeration** — generates up to 5 tautomeric forms per molecule using RDKit.
+6. **Deduplication** — canonicalises SMILES and merges duplicates (from different salt forms, enumerated isomers, or overlapping suppliers), keeping all original IDs.
+7. **Ionisation** — enumerates protonation states at pH 6.4–8.4 using Dimorphite-DL, then deduplicates again.
+8. **3D conformer generation** — generates low-energy conformers using rdkonf (Ebejer et al. method), parallelised across 32 cores.
 
 ## Requirements
+
 ```bash
 conda create -n chem python=3.11
 conda activate chem
@@ -21,13 +24,33 @@ git clone https://github.com/stevenshave/rdkonf.git
 ```
 
 ## Usage
+
 ```bash
 python library_pipeline.py \
     --input supplier1.smi supplier2.smi \
     --output library_3d.sdf \
     --rdkonf rdkonf/rdkonf.py \
-    --n-workers 32 \
-    --save-intermediates
-```# library-prep-pipeline
-Chemical library preparation pipeline for virtual screening
+    --n-workers 32
+```
 
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | (required) | One or more supplier SMILES files |
+| `--output` | library_3d.sdf | Output SDF with 3D coordinates |
+| `--rdkonf` | rdkonf/rdkonf.py | Path to rdkonf script |
+| `--n-workers` | 32 | Parallel workers for conformer generation |
+| `--max-unspecified-stereo` | 2 | Max unspecified stereocentres before rejection |
+| `--max-tautomers` | 5 | Max tautomers per molecule |
+| `--min-ph` / `--max-ph` | 6.4 / 8.4 | pH range for ionisation |
+| `--skip-tautomers` | off | Skip tautomer enumeration |
+| `--skip-ionise` | off | Skip Dimorphite-DL ionisation |
+| `--skip-conformers` | off | Skip 3D generation (output SMILES only) |
+| `--save-intermediates` | off | Save CSV at each step for debugging |
+
+## Acknowledgements
+
+- [RDKit](https://www.rdkit.org/) — cheminformatics toolkit
+- [Dimorphite-DL](https://github.com/durrantlab/dimorphite_dl) — protonation state enumeration
+- [rdkonf](https://github.com/stevenshave/rdkonf) — conformer generation (Ebejer et al. 2012)
