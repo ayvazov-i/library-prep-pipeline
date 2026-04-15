@@ -1,8 +1,8 @@
 # Chemical Library Preparation Pipeline
 
-Prepares raw supplier catalogues for virtual screening. Tested on 1M Moses molecules in 5.7 hours (32 cores).
+Prepares raw supplier catalogues for virtual screening
 
-## What it does
+## Steps
 
 1. **Load and merge** supplier catalogues — reads SMILES files from one or more suppliers into a single table, keeping track of original supplier SMILES and IDs throughout.
 2. **Strip salts** — removes counter-ions (Na+, Cl−, etc.) and keeps the largest fragment.

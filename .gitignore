@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+intermediate_*.csv
+*.sdf
+*.smi
+!test.smi
