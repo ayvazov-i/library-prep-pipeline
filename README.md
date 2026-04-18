@@ -54,3 +54,37 @@ python library_pipeline.py \
 - [RDKit](https://www.rdkit.org/) — cheminformatics toolkit
 - [Dimorphite-DL](https://github.com/durrantlab/dimorphite_dl) — protonation state enumeration
 - [rdkonf](https://github.com/stevenshave/rdkonf) — conformer generation (Ebejer et al. 2012)
+## GPU backend (nvMolKit)
+
+The pipeline supports GPU-accelerated conformer generation via
+[nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit), which
+implements batch ETKDG + MMFF on CUDA. On one NVIDIA L40S we measured
+~2,800 conformers/second sustained on 50k Enamine REAL molecules,
+compared to ~33 confs/s on 8 CPU cores with the default rdkonf backend.
+
+### Requirements
+- NVIDIA GPU with compute capability >= 7.0 (V100 or newer)
+- CUDA driver >= 560.28
+- RDKit 2025.03.1 or 2024.09.6
+
+### Install
+```bash
+conda install -c conda-forge nvmolkit
+```
+
+### Usage
+```bash
+# CPU backend (default)
+python library_pipeline.py --input mols.smi --output lib.sdf
+
+# GPU backend
+python library_pipeline.py --input mols.smi --output lib.sdf \
+    --conformer-backend nvmolkit --n-conformers 10
+```
+
+### Notes
+- `useRandomCoords=True` is enforced by nvMolKit; this matches RDKit's
+  recommended setting for flexible molecules.
+- A small fraction of Enamine REAL molecules (~0.04%) contain hypervalent
+  atoms MMFF94s cannot parametrise. These are written to the output SDF
+  without MMFF minimisation, tagged `MMFF_Minimised: False`.
