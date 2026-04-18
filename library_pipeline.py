@@ -459,6 +459,106 @@ def generate_conformers_rdkonf(df, output_sdf, rdkonf_path="rdkonf/rdkonf.py",
     print(f"  Time: {total_time:.0f}s ({total_time/3600:.1f}h)")
     print(f"  Throughput: {rate:.1f} mol/s")
     return output_sdf
+def generate_conformers_nvmolkit(df, output_sdf, n_conformers=1,
+                                  mmff_max_iters=200, batch_size=500,
+                                  batches_per_gpu=4, gpu_ids=None,
+                                  preprocessing_threads=8):
+    """Generate 3D conformers using nvMolKit on GPU.
+
+    Requires nvMolKit and an NVIDIA GPU with compute capability >= 7.0.
+    Falls back with a clear error if nvMolKit is not installed.
+    """
+    print("\n" + "=" * 60)
+    print("STEP 7: CONFORMER GENERATION (nvMolKit / GPU)")
+    print("=" * 60)
+
+    try:
+        from rdkit.Chem import SDWriter, AllChem
+        from rdkit.Chem.rdDistGeom import ETKDGv3
+        from nvmolkit.embedMolecules import EmbedMolecules
+        from nvmolkit.mmffOptimization import MMFFOptimizeMoleculesConfs
+        from nvmolkit.types import HardwareOptions
+    except ImportError as e:
+        print(f"  ERROR: nvMolKit not available ({e})")
+        print(f"  Install with: conda install -c conda-forge nvmolkit")
+        print(f"  Or use --conformer-backend rdkonf for the CPU path.")
+        return None
+
+    t0 = time.time()
+
+    # 1. SMILES -> Mol with explicit Hs
+    mols = []
+    parse_fail = 0
+    for _, row in df.iterrows():
+        m = Chem.MolFromSmiles(row["SMILES"])
+        if m is None:
+            parse_fail += 1
+            continue
+        m = Chem.AddHs(m)
+        m.SetProp("_Name", str(row["ID"]))
+        mols.append(m)
+    print(f"  Prepared {len(mols):,} molecules ({parse_fail} parse failures)")
+
+    # 2. ETKDG params — useRandomCoords=True is required by nvMolKit
+    params = ETKDGv3()
+    params.useRandomCoords = True
+
+    # 3. Hardware config
+    hw = HardwareOptions(
+        preprocessingThreads=preprocessing_threads,
+        batchSize=batch_size,
+        batchesPerGpu=batches_per_gpu,
+        gpuIds=gpu_ids if gpu_ids else [],
+    )
+
+    # 4. GPU embed (modifies mols in-place)
+    t_embed = time.time()
+    print(f"  Embedding {n_conformers} confs/mol on GPU...")
+    EmbedMolecules(mols, params, confsPerMolecule=n_conformers,
+                   hardwareOptions=hw)
+    print(f"    embed wall-clock: {time.time() - t_embed:.1f}s")
+
+    # 5. Partition by MMFF-parametrisability
+    mmff_ok, mmff_bad = [], []
+    for m in mols:
+        if AllChem.MMFFGetMoleculeProperties(m, mmffVariant="MMFF94s") is None:
+            mmff_bad.append(m)
+        else:
+            mmff_ok.append(m)
+    if mmff_bad:
+        print(f"  MMFF parametrisable: {len(mmff_ok):,} / {len(mols):,} "
+              f"({len(mmff_bad)} skipped)")
+
+    # 6. GPU MMFF minimise the parametrisable ones
+    t_mmff = time.time()
+    print(f"  MMFF minimising (maxIters={mmff_max_iters}) on GPU...")
+    energies = MMFFOptimizeMoleculesConfs(
+        mmff_ok, maxIters=mmff_max_iters, hardwareOptions=hw
+    )
+    print(f"    mmff wall-clock:  {time.time() - t_mmff:.1f}s")
+
+    # 7. Write all conformers, tagging whether minimised
+    writer = SDWriter(output_sdf)
+    n_written = 0
+    for m, mol_energies in zip(mmff_ok, energies):
+        for cid in range(m.GetNumConformers()):
+            if cid < len(mol_energies):
+                m.SetProp("MMFF_Energy", f"{mol_energies[cid]:.3f}")
+            m.SetProp("MMFF_Minimised", "True")
+            writer.write(m, confId=cid)
+            n_written += 1
+    for m in mmff_bad:
+        for cid in range(m.GetNumConformers()):
+            m.SetProp("MMFF_Minimised", "False")
+            writer.write(m, confId=cid)
+            n_written += 1
+    writer.close()
+
+    dt = time.time() - t0
+    print(f"\n  Conformers written: {n_written:,}")
+    print(f"  Total time: {dt:.1f}s ({dt/3600:.2f}h)")
+    print(f"  Throughput: {n_written/dt:.1f} confs/s")
+    return output_sdf    
 
 
 def main():
@@ -492,6 +592,10 @@ def main():
                         help="Skip conformer generation")
     parser.add_argument("--save-intermediates", action="store_true",
                         help="Save intermediate CSV files")
+    parser.add_argument("--conformer-backend", choices=["rdkonf", "nvmolkit"],
+                    default="rdkonf",
+                    help="Conformer generation backend: rdkonf (CPU, default) "
+                         "or nvmolkit (GPU, requires NVIDIA GPU)")                    
     args = parser.parse_args()
 
     t_total = time.time()
@@ -549,10 +653,16 @@ def main():
     print(f"  Final count:  {len(df):,}")
 
     if not args.skip_conformers:
-        generate_conformers_rdkonf(
-            df, output_sdf=args.output, rdkonf_path=args.rdkonf,
-            n_conformers=args.n_conformers, n_workers=args.n_workers,
-        )
+        if args.conformer_backend == "nvmolkit":
+            generate_conformers_nvmolkit(
+                df, output_sdf=args.output,
+                n_conformers=args.n_conformers,
+            )
+        else:
+            generate_conformers_rdkonf(
+                df, output_sdf=args.output, rdkonf_path=args.rdkonf,
+                n_conformers=args.n_conformers, n_workers=args.n_workers,
+            )
 
     total_time = time.time() - t_total
     print("\n" + "=" * 60)
