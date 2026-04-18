@@ -125,10 +125,7 @@ automatically.
 
 The pipeline supports GPU-accelerated conformer generation via
 [nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit), which
-implements batch ETKDG + MMFF on CUDA. On one NVIDIA L40S we measured
-~2,800 conformers/second sustained on 50k Enamine REAL molecules,
-compared to ~33 confs/s on 8 CPU cores with the default rdkonf backend.
-
+implements batch ETKDG + MMFF on CUDA.
 ### Requirements
 - NVIDIA GPU with compute capability >= 7.0 (V100 or newer)
 - CUDA driver >= 560.28
