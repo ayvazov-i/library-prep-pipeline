@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import time
 import subprocess
@@ -7,6 +8,10 @@ import tempfile
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 from typing import List, Tuple
+
+# Matches a trailing CXSmiles extension block: |...|
+# These appear in Enamine REAL cxsmiles files to encode stereo/query features.
+_CXSMILES_EXT_RE = re.compile(r'\s*\|[^|]*\|\s*$')
 
 import pandas as pd
 from rdkit import Chem
@@ -34,7 +39,22 @@ except ImportError:
 
 
 def load_supplier_file(filepath, supplier_name=None):
-    """Load a supplier SMILES file into a DataFrame with standardised columns."""
+    """Load a supplier SMILES/cxsmiles file into a DataFrame.
+
+    Handles two layouts:
+
+    1. **Tab-delimited cxsmiles** (e.g. Enamine REAL):
+       ``<SMILES [|ext|]>\\t<ID>\\t...``
+       The CXSmiles extension block lives *inside* the first tab-field.
+
+    2. **Space-delimited plain SMILES**:
+       ``<SMILES> <ID>``
+       or the legacy form where the extension is a separate token:
+       ``<SMILES> |ext| <ID>``
+
+    In all cases the ``|...|`` extension is stripped from the SMILES before
+    it is passed to RDKit, and ``|...|`` tokens are never mistaken for IDs.
+    """
     if supplier_name is None:
         supplier_name = Path(filepath).stem
 
@@ -44,17 +64,36 @@ def load_supplier_file(filepath, supplier_name=None):
             line = line.strip()
             if not line:
                 continue
-            parts = line.split()
-            if not parts:
+
+            # --- split into fields -------------------------------------------
+            if "\t" in line:
+                # Tab-delimited: CXSmiles extension is part of field 0
+                fields = line.split("\t")
+                smiles_raw = fields[0].strip()
+                mol_id = fields[1].strip() if len(fields) > 1 else None
+            else:
+                # Space-delimited: extension may be a free-standing |...| token
+                fields = line.split()
+                smiles_raw = fields[0]
+                # Skip any |...| tokens to find the real ID
+                non_ext = [f for f in fields[1:] if not f.startswith("|")]
+                mol_id = non_ext[0] if non_ext else None
+
+            # --- header detection --------------------------------------------
+            bare = _CXSMILES_EXT_RE.sub("", smiles_raw).strip()
+            if bare.upper() in ("SMILES", "CANONICAL_SMILES", "SMI", "SMILE"):
                 continue
-            smiles = parts[0]
-            if smiles.upper() in ("SMILES", "CANONICAL_SMILES", "SMI", "SMILE"):
-                continue
-            mol_id = parts[1] if len(parts) > 1 else f"{supplier_name}_{line_num}"
+
+            # --- strip CXSmiles extension from SMILES ------------------------
+            smiles = _CXSMILES_EXT_RE.sub("", smiles_raw).strip()
+
+            if mol_id is None or mol_id == "":
+                mol_id = f"{supplier_name}_{line_num}"
+
             records.append({
                 "ID": mol_id,
                 "SMILES": smiles,
-                "original_supplier_smiles": smiles,
+                "original_supplier_smiles": smiles_raw,  # keep raw for audit
                 "supplier": supplier_name,
             })
 

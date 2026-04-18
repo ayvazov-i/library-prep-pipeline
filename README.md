@@ -23,6 +23,26 @@ pip install pandas dimorphite-dl
 git clone https://github.com/stevenshave/rdkonf.git
 ```
 
+## Benchmarks
+
+Conformer generation throughput, 10 conformers per molecule, Enamine REAL compounds:
+
+| Scale     | Backend   | Hardware    | Output confs | Time     | Throughput         |
+|-----------|-----------|-------------|--------------|----------|--------------------|
+| 10k       | RDKit     | 8 CPU cores | 100k         | 17m      | 95 confs/s         |
+| 10k       | nvMolKit  | 1 GPU       | 100k         | 32s      | 3,100 confs/s      |
+| 100k      | nvMolKit  | 1 GPU       | ~2.0M        | 15m      | 2,737 confs/s      |
+| **1M**    | nvMolKit  | 1 GPU       | **24.7M**    | **3h 39m** | **~1,990 confs/s** (steady-state) |
+
+The 1M run used the chunked runner (200k mols/chunk); throughput is reported
+as steady-state across chunks 6–13 to exclude shared-server contention
+observed during chunks 1–5. End-to-end average including contention: 1,884 confs/s.
+
+Speedup vs. RDKit CPU baseline: **~29×** at production scale.
+
+Hardware: NVIDIA RTX 5090 (32 GB), Intel Xeon server with 8 CPU workers for
+preprocessing.
+
 ## Usage
 
 ```bash
@@ -48,6 +68,53 @@ python library_pipeline.py \
 | `--skip-ionise` | off | Skip Dimorphite-DL ionisation |
 | `--skip-conformers` | off | Skip 3D generation (output SMILES only) |
 | `--save-intermediates` | off | Save CSV at each step for debugging |
+
+## Large-scale runs (chunked GPU)
+
+The built-in `generate_conformers_nvmolkit` loads all molecules into RAM
+before calling `EmbedMolecules`. On servers with <128 GB RAM this OOMs
+around ~1M input molecules (post stereo/tautomer expansion: ~2M+ mols).
+
+For large runs, use the standalone chunked runner:
+
+```bash
+# First, run the CPU stages of the main pipeline up to ionisation,
+# writing the final SMILES to disk:
+python library_pipeline.py \
+    --input enamine_real_chunk.smi \
+    --output library.sdf \
+    --skip-conformers \
+    --save-intermediates
+
+# Then run conformer generation in bounded-memory chunks:
+python run_conformers_chunked.py \
+    --input library_final.smi \
+    --output library.sdf \
+    --chunk-size 200000 \
+    --n-conformers 10
+```
+
+The runner streams conformers directly to the output SDF, freeing each
+chunk's molecules before loading the next. Memory stays bounded at
+`chunk-size` mols regardless of total input size. Validated at 2.6M mols
+(≈1M input after expansion) producing 24.7M conformers.
+
+Tune `--chunk-size` down to 100k if system RAM is constrained; throughput
+is essentially unchanged.
+
+## Input formats
+
+Supplier files can be either plain SMILES or cxsmiles:
+
+- **Tab-delimited cxsmiles** (Enamine REAL format):
+  `SMILES [|ext|]\tID\t...` — the CXSmiles extension `|...|` lives inside
+  field 0 and is stripped before parsing.
+
+- **Space-delimited SMILES**: `SMILES ID` — extensions, if present as
+  free-standing tokens, are ignored when identifying the compound ID.
+
+Header rows (`SMILES`, `CANONICAL_SMILES`, `SMI`, `SMILE`) are skipped
+automatically.
 
 ## Acknowledgements
 
