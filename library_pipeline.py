@@ -1,6 +1,5 @@
 import argparse
 import os
-import re
 import sys
 import time
 import subprocess
@@ -8,10 +7,6 @@ import tempfile
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 from typing import List, Tuple
-
-# Matches a trailing CXSmiles extension block: |...|
-# These appear in Enamine REAL cxsmiles files to encode stereo/query features.
-_CXSMILES_EXT_RE = re.compile(r'\s*\|[^|]*\|\s*$')
 
 import pandas as pd
 from rdkit import Chem
@@ -38,23 +33,88 @@ except ImportError:
         dimorphite_protonate = None
 
 
-def load_supplier_file(filepath, supplier_name=None):
-    """Load a supplier SMILES/cxsmiles file into a DataFrame.
+# ---------- nvMolKit GPU PAINS support ----------
 
-    Handles two layouts:
+import csv
 
-    1. **Tab-delimited cxsmiles** (e.g. Enamine REAL):
-       ``<SMILES [|ext|]>\\t<ID>\\t...``
-       The CXSmiles extension block lives *inside* the first tab-field.
+try:
+    from nvmolkit.substructure import hasSubstructMatch as _nvmk_has_match
+    _NVMOLKIT_AVAILABLE = True
+except ImportError:
+    _NVMOLKIT_AVAILABLE = False
+    _nvmk_has_match = None
 
-    2. **Space-delimited plain SMILES**:
-       ``<SMILES> <ID>``
-       or the legacy form where the extension is a separate token:
-       ``<SMILES> |ext| <ID>``
 
-    In all cases the ``|...|`` extension is stripped from the SMILES before
-    it is passed to RDKit, and ``|...|`` tokens are never mistaken for IDs.
+def find_pains_csv():
+    """Locate PAINS SMARTS CSV. Search order:
+       1. PAINS_CSV env var
+       2. pains_smarts.csv next to this script
+       3. RDKit's bundled wehi_pains.csv (may be absent in some installs)
     """
+    import rdkit as _rdkit
+    env = os.environ.get("PAINS_CSV")
+    if env and os.path.exists(env):
+        return env
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.join(script_dir, "pains_smarts.csv")
+    if os.path.exists(bundled):
+        return bundled
+    rdkit_path = os.path.join(
+        os.path.dirname(_rdkit.__file__), "Data", "Pains", "wehi_pains.csv"
+    )
+    if os.path.exists(rdkit_path):
+        return rdkit_path
+    raise FileNotFoundError(
+        "PAINS SMARTS CSV not found. Tried $PAINS_CSV, "
+        f"{bundled}, and {rdkit_path}."
+    )
+
+
+def load_pains_query_mols():
+    """Load PAINS SMARTS as RDKit query Mols + their reg-IDs.
+    Cached at module level — only loaded once per process."""
+    if hasattr(load_pains_query_mols, "_cache"):
+        return load_pains_query_mols._cache
+    path = find_pains_csv()
+    queries, names = [], []
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            smarts, raw_name = row[0], row[1]
+            q = Chem.MolFromSmarts(smarts)
+            if q is None:
+                continue
+            queries.append(q)
+            names.append(raw_name.strip("<>").replace("regId=", ""))
+    load_pains_query_mols._cache = (queries, names)
+    return queries, names
+
+
+def _get_tautomer_canonicaliser():
+    """Lazily build a single TautomerEnumerator instance per process."""
+    if not hasattr(_get_tautomer_canonicaliser, "_cache"):
+        enum = rdMolStandardize.TautomerEnumerator()
+        # Keep this fast — Canonicalize() doesn't enumerate, just picks canonical form
+        _get_tautomer_canonicaliser._cache = enum
+    return _get_tautomer_canonicaliser._cache
+
+
+def canonical_tautomer(mol):
+    """Return the canonical tautomeric form of mol, or original on failure.
+    Canonicalising before BRENK/PAINS prevents tautomer-induced false positives
+    (e.g. amides drawn as imidic acid tripping the C=N rule)."""
+    if mol is None:
+        return None
+    try:
+        return _get_tautomer_canonicaliser().Canonicalize(mol)
+    except Exception:
+        return mol
+
+
+def load_supplier_file(filepath, supplier_name=None):
+    """Load a supplier SMILES file into a DataFrame with standardised columns."""
     if supplier_name is None:
         supplier_name = Path(filepath).stem
 
@@ -64,36 +124,17 @@ def load_supplier_file(filepath, supplier_name=None):
             line = line.strip()
             if not line:
                 continue
-
-            # --- split into fields -------------------------------------------
-            if "\t" in line:
-                # Tab-delimited: CXSmiles extension is part of field 0
-                fields = line.split("\t")
-                smiles_raw = fields[0].strip()
-                mol_id = fields[1].strip() if len(fields) > 1 else None
-            else:
-                # Space-delimited: extension may be a free-standing |...| token
-                fields = line.split()
-                smiles_raw = fields[0]
-                # Skip any |...| tokens to find the real ID
-                non_ext = [f for f in fields[1:] if not f.startswith("|")]
-                mol_id = non_ext[0] if non_ext else None
-
-            # --- header detection --------------------------------------------
-            bare = _CXSMILES_EXT_RE.sub("", smiles_raw).strip()
-            if bare.upper() in ("SMILES", "CANONICAL_SMILES", "SMI", "SMILE"):
+            parts = line.split()
+            if not parts:
                 continue
-
-            # --- strip CXSmiles extension from SMILES ------------------------
-            smiles = _CXSMILES_EXT_RE.sub("", smiles_raw).strip()
-
-            if mol_id is None or mol_id == "":
-                mol_id = f"{supplier_name}_{line_num}"
-
+            smiles = parts[0]
+            if smiles.upper() in ("SMILES", "CANONICAL_SMILES", "SMI", "SMILE"):
+                continue
+            mol_id = parts[1] if len(parts) > 1 else f"{supplier_name}_{line_num}"
             records.append({
                 "ID": mol_id,
                 "SMILES": smiles,
-                "original_supplier_smiles": smiles_raw,  # keep raw for audit
+                "original_supplier_smiles": smiles,
                 "supplier": supplier_name,
             })
 
@@ -165,81 +206,155 @@ def build_filters():
     return pains_cat, brenk_cat
 
 
-def apply_filters(df):
-    """
-    Apply compound filters: complexity, BRENK, Lipinski, rings, aggregator, PAINS.
+def apply_filters(df, pains_backend="auto"):
+    """Apply compound filters: complexity, BRENK, Lipinski, rings, aggregator, PAINS.
+
+    PAINS is batched on GPU when pains_backend in ("gpu", "auto") and nvMolKit is
+    available; falls back to CPU FilterCatalog otherwise. BRENK stays on CPU.
+
     Returns (passed_df, failed_df).
     """
     print("\n" + "=" * 60)
     print("STEP 3: COMPOUND FILTERING")
     print("=" * 60)
 
-    pains_cat, brenk_cat = build_filters()
-    passed = []
-    failed = []
+    # Resolve backend
+    if pains_backend == "auto":
+        backend = "gpu" if _NVMOLKIT_AVAILABLE else "cpu"
+    else:
+        backend = pains_backend
+    if backend == "gpu" and not _NVMOLKIT_AVAILABLE:
+        print("  WARNING: --pains-backend gpu requested but nvMolKit not importable. "
+              "Falling back to CPU.")
+        backend = "cpu"
+    print(f"  PAINS backend: {backend}")
 
-    for _, row in df.iterrows():
+    # BRENK is always CPU (no public SMARTS data file in RDKit)
+    brenk_params = FilterCatalogParams()
+    brenk_params.AddCatalog(FilterCatalogParams.FilterCatalogs.BRENK)
+    brenk_cat = FilterCatalog.FilterCatalog(brenk_params)
+
+    if backend == "gpu":
+        pains_queries, pains_names = load_pains_query_mols()
+        print(f"  PAINS patterns loaded: {len(pains_queries)}")
+        pains_cat = None
+    else:
+        pains_params = FilterCatalogParams()
+        pains_params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+        pains_cat = FilterCatalog.FilterCatalog(pains_params)
+        pains_queries = pains_names = None
+
+    # ---------- Pass 1: per-molecule CPU checks ----------
+    t1 = time.time()
+    survivors = []        # (orig_index, row, mol) — only when GPU PAINS deferred
+    failed_records = []
+
+    for orig_idx, row in df.iterrows():
         smi = row["SMILES"]
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
-            failed.append({**row, "fail_reason": "parse_failed"})
+            failed_records.append({**row, "fail_reason": "parse_failed"})
+            continue
+
+        # Canonicalise tautomer BEFORE any filter check. Without this, BRENK/PAINS
+        # will flag enol/imidic-acid drawings of ordinary amides and ketones. See
+        # the 96% rescue rate from our A/B test on intermediate_03_failed.csv.
+        mol = canonical_tautomer(mol)
+        if mol is None:
+            failed_records.append({**row, "fail_reason": "tautomer_canon_failed"})
             continue
 
         n_heavy = mol.GetNumHeavyAtoms()
         if n_heavy < 15:
-            failed.append({**row, "fail_reason": f"too_small:heavy_atoms={n_heavy}"})
+            failed_records.append({**row, "fail_reason": f"too_small:heavy_atoms={n_heavy}"})
             continue
         if n_heavy > 70:
-            failed.append({**row, "fail_reason": f"too_large:heavy_atoms={n_heavy}"})
+            failed_records.append({**row, "fail_reason": f"too_large:heavy_atoms={n_heavy}"})
             continue
 
         if brenk_cat.HasMatch(mol):
             match = brenk_cat.GetFirstMatch(mol)
-            failed.append({**row, "fail_reason": f"brenk:{match.GetDescription()}"})
+            failed_records.append({**row, "fail_reason": f"brenk:{match.GetDescription()}"})
             continue
 
         mw = Descriptors.MolWt(mol)
         logp = Descriptors.MolLogP(mol)
         hbd = Descriptors.NumHDonors(mol)
         hba = Descriptors.NumHAcceptors(mol)
-
         lip_violations = []
         if mw > 500: lip_violations.append(f"MW={mw:.0f}")
         if logp > 5: lip_violations.append(f"logP={logp:.1f}")
         if hbd > 5: lip_violations.append(f"HBD={hbd}")
         if hba > 10: lip_violations.append(f"HBA={hba}")
         if lip_violations:
-            failed.append({**row, "fail_reason": f"lipinski:{';'.join(lip_violations)}"})
+            failed_records.append({**row, "fail_reason": f"lipinski:{';'.join(lip_violations)}"})
             continue
 
         ring_info = mol.GetRingInfo()
         n_rings = ring_info.NumRings()
         if n_rings > 6:
-            failed.append({**row, "fail_reason": f"too_many_rings:{n_rings}"})
+            failed_records.append({**row, "fail_reason": f"too_many_rings:{n_rings}"})
             continue
         if n_rings > 0:
             largest_ring = max(len(r) for r in ring_info.AtomRings())
             if largest_ring > 8:
-                failed.append({**row, "fail_reason": f"large_ring:size={largest_ring}"})
+                failed_records.append({**row, "fail_reason": f"large_ring:size={largest_ring}"})
                 continue
 
         if logp > 4.0 and mw > 400:
             fsp3 = rdMolDescriptors.CalcFractionCSP3(mol)
             if fsp3 < 0.1 and logp > 4.5:
-                failed.append({**row, "fail_reason": f"aggregator:logP={logp:.1f};MW={mw:.0f};Fsp3={fsp3:.2f}"})
+                failed_records.append({
+                    **row,
+                    "fail_reason": f"aggregator:logP={logp:.1f};MW={mw:.0f};Fsp3={fsp3:.2f}",
+                })
                 continue
 
-        if pains_cat.HasMatch(mol):
-            match = pains_cat.GetFirstMatch(mol)
-            failed.append({**row, "fail_reason": f"pains:{match.GetDescription()}"})
-            continue
+        if backend == "cpu":
+            # CPU PAINS short-circuit, inline
+            if pains_cat.HasMatch(mol):
+                match = pains_cat.GetFirstMatch(mol)
+                failed_records.append({**row, "fail_reason": f"pains:{match.GetDescription()}"})
+                continue
+            survivors.append((orig_idx, row, mol))
+        else:
+            # GPU path: defer PAINS to batched pass 2
+            survivors.append((orig_idx, row, mol))
 
-        passed.append(row)
+    t1_dt = time.time() - t1
+    print(f"  Pass 1 (CPU checks): {t1_dt:.1f}s")
+    print(f"    rejected:  {len(failed_records):,}")
+    print(f"    survivors: {len(survivors):,}")
+
+    # ---------- Pass 2: batched GPU PAINS ----------
+    if backend == "gpu" and survivors:
+        import numpy as np
+        t2 = time.time()
+        survivor_mols = [m for _, _, m in survivors]
+        n_checks = len(survivor_mols) * len(pains_queries)
+        print(f"  Pass 2 (GPU PAINS): {len(survivor_mols):,} mols x "
+              f"{len(pains_queries)} patterns = {n_checks:,} checks")
+
+        match_matrix = np.asarray(_nvmk_has_match(survivor_mols, pains_queries))
+
+        passed = []
+        for i, (_, row, _) in enumerate(survivors):
+            hits = np.where(match_matrix[i] == 1)[0]
+            if hits.size > 0:
+                first = int(hits[0])
+                failed_records.append({**row, "fail_reason": f"pains:{pains_names[first]}"})
+            else:
+                passed.append(row)
+        t2_dt = time.time() - t2
+        print(f"    GPU call + reduction: {t2_dt:.2f}s")
+        print(f"    PAINS rejects: {len(survivors) - len(passed):,}")
+    else:
+        passed = [row for _, row, _ in survivors]
 
     pass_df = pd.DataFrame(passed)
-    fail_df = pd.DataFrame(failed)
+    fail_df = pd.DataFrame(failed_records)
 
-    print(f"  Passed: {len(pass_df):,}")
+    print(f"\n  Passed: {len(pass_df):,}")
     print(f"  Failed: {len(fail_df):,}")
     if len(fail_df) > 0 and "fail_reason" in fail_df.columns:
         reasons = fail_df["fail_reason"].apply(lambda x: x.split(":")[0])
@@ -634,7 +749,11 @@ def main():
     parser.add_argument("--conformer-backend", choices=["rdkonf", "nvmolkit"],
                     default="rdkonf",
                     help="Conformer generation backend: rdkonf (CPU, default) "
-                         "or nvmolkit (GPU, requires NVIDIA GPU)")                    
+                         "or nvmolkit (GPU, requires NVIDIA GPU)")
+    parser.add_argument("--pains-backend", choices=["auto", "cpu", "gpu"],
+                        default="auto",
+                        help="PAINS filter backend: auto (gpu if nvMolKit "
+                             "available, else cpu), cpu, or gpu. Default: auto.")
     args = parser.parse_args()
 
     t_total = time.time()
@@ -653,7 +772,7 @@ def main():
     if args.save_intermediates:
         df.to_csv("intermediate_02_salts_stripped.csv", index=False)
 
-    df, failed_df = apply_filters(df)
+    df, failed_df = apply_filters(df, pains_backend=args.pains_backend)
     if args.save_intermediates:
         df.to_csv("intermediate_03_filtered.csv", index=False)
         failed_df.to_csv("intermediate_03_failed.csv", index=False)
